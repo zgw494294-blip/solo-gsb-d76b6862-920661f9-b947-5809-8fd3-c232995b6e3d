@@ -74,6 +74,7 @@ const form = document.getElementById("judge-form");
 const errorBox = document.getElementById("error-box");
 const pendingHint = document.getElementById("pending-hint");
 const resultsBox = document.getElementById("results");
+const diagnosisBox = document.getElementById("diagnosis");
 
 /* ---------- 行管理 ---------- */
 
@@ -177,6 +178,7 @@ function clearOutcome() {
   errorBox.hidden = true;
   renderedLapKeys = []; // 结果区已清空，旧的趟键索引全部失效
   latestResult = null; // 名次表随之隐藏，等待最新合法结果
+  clearDiagnosis(); // 诊断只针对上一份采纳结果：输入一改即清除
 }
 
 function onInputChanged() {
@@ -411,6 +413,7 @@ async function runAdjudication() {
     pendingHint.hidden = true;
     resultsBox.innerHTML = "";
     latestResult = null;
+    clearDiagnosis(); // 裁决服务不可达：无采纳结果，诊断卡片同样清除
     showError(`无法连接裁决服务：${err.message}`);
     return;
   }
@@ -420,6 +423,7 @@ async function runAdjudication() {
     // 非法输入：清空结果区，只显示错误（不展示部分结果）。
     resultsBox.innerHTML = "";
     latestResult = null;
+    clearDiagnosis(); // 没有采纳结果即不可检查：旧诊断卡片一并消失
     showError(data.error || "裁决失败");
   } else {
     errorBox.hidden = true;
@@ -910,7 +914,247 @@ function renderResults(result) {
     .join("");
   // 名次表排在最前，使用渲染这一刻已保存的罚秒。
   resultsBox.innerHTML = rankingCardHtml(result) + runnerCards;
+  // 新采纳结果到达：诊断区恢复为“可检查”的空白初始卡片（旧诊断不保留）。
+  inFlightSeq = null;
+  renderDiagnosisState({ kind: "idle" });
 }
+
+/* ---------- 检查替代性（只读诊断，不替换采纳结果） ---------- */
+
+// 诊断以“当前完整裁决输入”为唯一依据，经 HTTP 调 POST /api/diagnose，
+// 与复核/罚秒一样只活在页面上：不改采纳、不改复核、不改罚秒与名次。
+// 时序守卫：
+//   1) 输入一改（onInputChanged/clearOutcome）整个诊断区立即清空、在途请求
+//      与当前卡片脱钩，旧响应随后返回也因代际号/inputVersion 失配而丢弃；
+//   2) 输入非法或裁决重算在途时，页面没有采纳结果卡片，按钮无从点击；
+//   3) 同一输入连点“检查”只允许一个在途诊断请求（inFlightSeq 守卫），
+//      迟到的成功或失败都不得覆盖较新状态。
+const DIAG_CATEGORY_LABELS = {
+  equal: "同优可替代",
+  suboptimal: "仅次优可用",
+  no_lap: "无法成趟",
+};
+
+// diagnosisSeq 为单调递增的请求代际号（只增不复用）；inFlightSeq 指向
+// “当前这张诊断卡片上仍在途”的那次请求，null 表示空闲。输入一改卡片即销毁，
+// 在途请求随之与当前卡片脱钩——旧响应代际号失配，且新请求会拿到全新代际号。
+let diagnosisSeq = 0;
+let inFlightSeq = null;
+
+// 重算/输入变更后裁决结果被清空：诊断卡片一并消失，不可检查。
+function clearDiagnosis() {
+  inFlightSeq = null; // 卡片销毁：任何在途请求都不再属于当前页面
+  diagnosisSeq += 1; // 代际号继续推进，保证旧响应的代际比较必失配
+  diagnosisBox.innerHTML = "";
+}
+
+function diagnosisInFlight() {
+  return inFlightSeq !== null;
+}
+
+// 卡片整体渲染：state 为
+//   { kind: "idle" }                      初始可检查
+//   { kind: "loading" }                   诊断在途
+//   { kind: "error", message }            诊断失败
+//   { kind: "done", diagnosis }           展示诊断结果
+// 每次都整体重写 #diagnosis（按钮随之重建，点击监听委托在容器上不会丢）。
+function diagnosisCardHtml(state) {
+  const inFlight = state.kind === "loading";
+  const statusLine = (() => {
+    if (state.kind === "loading")
+      return `<p class="diag-status">正在按当前完整裁决输入进行替代性诊断…</p>`;
+    if (state.kind === "error")
+      return `<p class="diag-status err">⚠ ${escapeHtml(state.message)}</p>`;
+    return `<p class="diag-status" hidden></p>`;
+  })();
+
+  let output = "";
+  if (state.kind === "done") output = diagnosisOutputHtml(state.diagnosis);
+
+  return `
+  <section class="result-card diagnosis-card">
+    <div class="result-head">
+      <h3>检查替代性（只读诊断）</h3>
+      <span class="review-scope">按当前完整裁决输入，经 HTTP 诊断各选手的未采纳记录；不替换采纳结果，不改变复核、罚秒或名次</span>
+    </div>
+    <div class="diag-actions">
+      <button type="button" class="btn secondary diag-check-btn"${
+        inFlight ? " disabled" : ""
+      }>检查替代性</button>
+      <span class="review-scope">同优只比较计次数与原总用时，不考虑 ID 决胜与罚秒；返回包含目标记录的整套合法方案</span>
+    </div>
+    ${statusLine}
+    ${output}
+  </section>`;
+}
+
+function renderDiagnosisState(state) {
+  diagnosisBox.innerHTML = diagnosisCardHtml(state);
+}
+
+// 诊断响应规范化：runner 与所有秒数保持规范十进制字符串（任意精度无损），
+// 计次数还原为 Number；结构沿用 normalizeResult 的约定。
+function normalizeDiagnosis(diagnosis) {
+  for (const r of diagnosis.runners) {
+    r.runner = typeof r.runner === "string" ? r.runner : String(r.runner);
+    for (const u of r.unused) {
+      u.time = intToText(u.time);
+      if (u.alternative) {
+        u.alternative.lapCount =
+          typeof u.alternative.lapCount === "string"
+            ? Number(u.alternative.lapCount)
+            : u.alternative.lapCount;
+        u.alternative.totalTime = intToText(u.alternative.totalTime);
+      }
+    }
+  }
+  return diagnosis;
+}
+
+// 按 ID 查最新采纳结果中的记录（门、秒数），用于富展示替代方案趟。
+function buildRecordIndex(result) {
+  const idx = new Map();
+  // 采纳记录
+  for (const r of result.runners) {
+    for (const lap of r.laps) {
+      for (const [gate, node] of [
+        ["S", lap.start],
+        ["M", lap.middle],
+        ["F", lap.finish],
+      ]) {
+        idx.set(`${r.runner}/${node.id}`, { gate, time: node.time });
+      }
+    }
+  }
+  // 未采纳记录
+  for (const r of result.runners) {
+    for (const u of r.unused) {
+      idx.set(`${r.runner}/${u.id}`, { gate: u.gate, time: u.time });
+    }
+  }
+  return idx;
+}
+
+function diagMiniHtml(runner, recId, recordIndex, targetId) {
+  const meta = recordIndex.get(`${runner}/${recId}`);
+  const gate = meta ? meta.gate : "S";
+  const timeText = meta ? meta.time : "—";
+  const target = recId === targetId ? " target" : "";
+  return `<span class="diag-mini ${gate.toLowerCase()}${target}">${GATE_LABELS[gate]} · ${escapeHtml(
+    recId
+  )} · ${timeText} 秒</span>`;
+}
+
+function diagItemHtml(runner, entry, recordIndex) {
+  const label = DIAG_CATEGORY_LABELS[entry.category] || entry.category;
+  const head = `
+    <div class="diag-item-head">
+      <span class="diag-id">${escapeHtml(entry.id)}</span>
+      <span class="chip-mini ${entry.gate}">${GATE_LABELS[entry.gate]} · ${entry.time} 秒</span>
+      <span class="diag-tag ${entry.category}">${label}</span>
+    </div>`;
+
+  let altHtml = "";
+  if (entry.category === "equal" && entry.alternative) {
+    const alt = entry.alternative;
+    const laps = alt.laps
+      .map((lap, i) => {
+        const nodes = [
+          diagMiniHtml(runner, lap.start, recordIndex, entry.id),
+          diagMiniHtml(runner, lap.middle, recordIndex, entry.id),
+          diagMiniHtml(runner, lap.finish, recordIndex, entry.id),
+        ].join(`<span class="diag-arrow">→</span>`);
+        return `<div class="diag-alt-lap">第 ${i + 1} 趟：${nodes}</div>`;
+      })
+      .join("");
+    altHtml = `
+      <div class="diag-alt">
+        <div class="diag-alt-summary">
+          存在同优替代方案：计次 <strong>${alt.lapCount}</strong> 次，
+          原总用时 <strong>${alt.totalTime}</strong> 秒
+          （不含 ID 决胜、不含罚秒；绿框者为目标记录）
+        </div>
+        ${laps}
+        <div class="diag-alt-seq">整套方案 ID 序列：${alt.recordIds
+          .map((id) => escapeHtml(id))
+          .join(" → ")}</div>
+      </div>`;
+  }
+  return `<div class="diag-item">${head}${altHtml}</div>`;
+}
+
+function diagnosisOutputHtml(diagnosis) {
+  if (!latestResult) return ""; // 裁决结果已被更新的输入清掉：不落地
+  const recordIndex = buildRecordIndex(latestResult);
+
+  const runnersHtml = diagnosis.runners
+    .map((r) => {
+      const items =
+        r.unused.length === 0
+          ? `<div class="empty-line">（该选手没有未采纳记录，无需诊断）</div>`
+          : `<div class="diag-list">${r.unused
+              .map((u) => diagItemHtml(r.runner, u, recordIndex))
+              .join("")}</div>`;
+      return `
+        <div class="diag-runner">
+          <div class="diag-runner-title">选手 ${r.runner} 的未采纳记录（按录入顺序）</div>
+          ${items}
+        </div>`;
+    })
+    .join("");
+
+  return `<div class="subsection diag-output"><h4>诊断结果（只读展示，采纳结果保持不变）</h4>${runnersHtml}</div>`;
+}
+
+function renderDiagnosis(diagnosis) {
+  renderDiagnosisState({ kind: "done", diagnosis });
+}
+
+async function runDiagnosis() {
+  // 无最新合法采纳结果（非法输入 / 重算期间）不可检查。
+  if (!latestResult) return;
+  if (diagnosisInFlight()) return; // 诊断在途：重复点击直接忽略
+
+  const version = inputVersion;
+  diagnosisSeq += 1;
+  const seq = diagnosisSeq;
+  inFlightSeq = seq;
+  renderDiagnosisState({ kind: "loading" });
+
+  let resp;
+  let data;
+  try {
+    resp = await fetch("/api/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectPayload()),
+    });
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    // 迟到的失败不得覆盖新状态（输入已改 / 卡片已被清空）。
+    if (inFlightSeq !== seq || version !== inputVersion) return;
+    inFlightSeq = null;
+    renderDiagnosisState({ kind: "error", message: `无法连接诊断服务：${err.message}` });
+    return;
+  }
+  // 迟到的成功同样丢弃：输入已变（诊断卡片已被清空/重建）或已有更新的诊断。
+  if (inFlightSeq !== seq || version !== inputVersion) return;
+  inFlightSeq = null;
+
+  if (!resp.ok || !data.ok) {
+    // 诊断与裁决使用同一套校验；错误只显示在诊断区内，采纳结果不受影响。
+    renderDiagnosisState({ kind: "error", message: `诊断失败：${data.error || "未知错误"}` });
+    return;
+  }
+  renderDiagnosis(normalizeDiagnosis(data.diagnosis));
+}
+
+// 事件委托：诊断卡片随结果区一起渲染，但容器 #diagnosis 本身不被清空，
+// 监听器只需注册一次；卡片重建后旧按钮随之失效，不会产生重复绑定。
+diagnosisBox.addEventListener("click", (e) => {
+  if (!e.target.classList.contains("diag-check-btn")) return;
+  runDiagnosis();
+});
 
 /* ---------- 工具 ---------- */
 

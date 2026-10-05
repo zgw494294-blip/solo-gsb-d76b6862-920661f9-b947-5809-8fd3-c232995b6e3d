@@ -170,6 +170,7 @@ const addRecord = mk("add-record", "button");
 mk("record-count", "span");
 mk("error-box"); mk("pending-hint");
 const results = mk("results");
+mk("diagnosis");
 for (const id of ["smMin", "smMax", "mfMin", "mfMax"]) mk(id, "input");
 mk("sample-btn", "button"); mk("clear-btn", "button");
 
