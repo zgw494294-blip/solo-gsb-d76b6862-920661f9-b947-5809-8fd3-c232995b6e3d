@@ -6,7 +6,14 @@ import random
 import sys
 
 sys.path.insert(0, ".")
-from app.adjudication import AdjudicationError, Record, adjudicate, parse_payload
+from app.adjudication import (
+    AdjudicationError,
+    Record,
+    adjudicate,
+    diagnose,
+    parse_payload,
+)
+from app.adjudication import _build_trips
 
 RANGES = {"SM": (10, 60), "MF": (10, 60)}
 
@@ -314,6 +321,254 @@ def test_big_runner_numbers():
     print("test_big_runner_numbers OK")
 
 
+def diagnose_payload(spec, runners=(101,), ranges=RANGES):
+    return diagnose(
+        {
+            "standards": {
+                "smMin": ranges["SM"][0], "smMax": ranges["SM"][1],
+                "mfMin": ranges["MF"][0], "mfMax": ranges["MF"][1],
+            },
+            "runners": [{"number": r} for r in runners],
+            "records": [
+                {"id": i, "runner": r, "gate": g, "time": t} for i, r, g, t in spec
+            ],
+        }
+    )
+
+
+def dmap(spec, runners=(101,)):
+    out = diagnose_payload(spec, runners)
+    return {r["runner"]: {d["id"]: d for d in r["diagnoses"]} for r in out["runners"]}, out
+
+
+def test_diagnose_equal_second_lap():
+    # 第二趟有两条同秒起点 a2 / x2：两趟总用时完全相同（52），现方案仅按 ID 决胜选 a2；
+    # x2 未采纳，但包含它的整套两趟方案计次数、原总用时都相同 → “同优可替代”，
+    # 返回完整两趟 ID 序列（不是只看 x2 自己那一趟是否合格）。
+    spec = [
+        ("a1", 101, "S", 0), ("b1", 101, "M", 12), ("c1", 101, "F", 25),
+        ("a2", 101, "S", 30), ("x2", 101, "S", 30),
+        ("b2", 101, "M", 45), ("c2", 101, "F", 57),
+        ("x1", 101, "M", 200),
+        ("d1", 102, "S", 5), ("e1", 102, "M", 15), ("f1", 102, "F", 25),
+    ]
+    dm, out = dmap(spec, runners=(101, 102))
+    x2 = dm[101]["x2"]
+    assert x2["classification"] == "equal", x2
+    alt = x2["alternative"]
+    assert alt["lapCount"] == 2 and alt["totalTime"] == 52, alt
+    assert alt["recordIds"] == ["a1", "b1", "c1", "x2", "b2", "c2"], alt
+    # 孤立中途门 x1(200) 不属于任何合格趟。
+    assert dm[101]["x1"]["classification"] == "unusable"
+    # 102 没有未采纳记录。
+    assert dm[102] == {}
+    # 诊断不改变采纳结果：ID 字典序更小的 a2 仍是现方案。
+    adj = adjudicate(
+        {
+            "standards": {"smMin": 10, "smMax": 60, "mfMin": 10, "mfMax": 60},
+            "runners": [{"number": 101}, {"number": 102}],
+            "records": [{"id": i, "runner": r, "gate": g, "time": t} for i, r, g, t in spec],
+        }
+    )
+    assert [l["start"]["id"] for l in adj["runners"][0]["laps"]] == ["a1", "a2"]
+    # 原示例（不同秒、x2 更优）对照：a2 只能组成总用时更长的方案 → 仅次优可用。
+    spec2 = [
+        ("a1", 101, "S", 0), ("b1", 101, "M", 12), ("c1", 101, "F", 25),
+        ("a2", 101, "S", 30), ("b2", 101, "M", 45), ("c2", 101, "F", 58),
+        ("x2", 101, "S", 31),
+    ]
+    dm2, _ = dmap(spec2)
+    assert dm2[101]["a2"]["classification"] == "inferior", dm2[101]["a2"]
+    print("test_diagnose_equal_second_lap OK")
+
+
+def test_diagnose_equal_first_lap_whole_plan():
+    # 两条第一趟同秒同用时，ID 字典序大的 zS 未采纳，但包含它的整套两趟方案
+    # 计次数与总用时完全相同 → equal，返回完整两趟 ID 序列。
+    spec = [
+        ("zS", 1, "S", 0), ("aS", 1, "S", 0), ("M1", 1, "M", 10), ("F1", 1, "F", 20),
+        ("S2", 1, "S", 30), ("M2", 1, "M", 40), ("F2", 1, "F", 50),
+    ]
+    dm, _ = dmap(spec, runners=(1,))
+    z = dm[1]["zS"]
+    assert z["classification"] == "equal", z
+    assert z["alternative"]["recordIds"] == ["zS", "M1", "F1", "S2", "M2", "F2"], z
+    assert z["alternative"]["lapCount"] == 2 and z["alternative"]["totalTime"] == 40
+    print("test_diagnose_equal_first_lap_whole_plan OK")
+
+
+def test_diagnose_inferior_loses_count():
+    # 两小趟 (s1,m1,f1)=20 与 (s2,m2,f2)=40 严格可串（50>20），现方案 2 趟、总 60。
+    # mX(35) 唯一能组成的合格趟是“桥接趟” (s1,mX,f2)：sm=35、mf=55，一趟同时吃掉
+    # 两小趟所需的 s1 与 f2，包含它至多 1 趟 → 仅次优可用。
+    spec = [
+        ("s1", 1, "S", 0), ("m1", 1, "M", 10), ("f1", 1, "F", 20),
+        ("s2", 1, "S", 50), ("m2", 1, "M", 70), ("f2", 1, "F", 90),
+        ("mX", 1, "M", 35),
+    ]
+    dm, _ = dmap(spec, runners=(1,))
+    assert dm[1]["mX"]["classification"] == "inferior", dm[1]["mX"]
+    assert "alternative" not in dm[1]["mX"]
+    print("test_diagnose_inferior_loses_count OK")
+
+
+def test_diagnose_inferior_same_count_longer_time():
+    # sSlow 能成两趟（计数相同），但第二趟总用时更长 → 仍只是次优。
+    # 现方案：(s0,m1,f25)=25 + (s2,m2,f2)=25。
+    spec = [
+        ("s0", 1, "S", 0), ("m1", 1, "M", 10), ("f1", 1, "F", 25),
+        ("s2", 1, "S", 110), ("m2", 1, "M", 120), ("f2", 1, "F", 135),
+        # sSlow(109) 晚于第一趟终点 25、且比 s2 早，第二趟总用时 26 > 25。
+        ("sSlow", 1, "S", 109),
+    ]
+    dm, _ = dmap(spec, runners=(1,))
+    assert dm[1]["sSlow"]["classification"] == "inferior", dm[1]["sSlow"]
+    print("test_diagnose_inferior_same_count_longer_time OK")
+
+
+def test_diagnose_unusable_and_zero_laps():
+    # 零次选手的所有记录都是 unusable；有方案时孤立门也是 unusable。
+    spec_zero = [("s1", 7, "S", 0), ("m1", 7, "M", 5), ("f1", 7, "F", 9)]
+    dm, out = dmap(spec_zero, runners=(7,))
+    assert out["runners"][0]["lapCount"] == 0 and out["runners"][0]["totalTime"] == 0
+    assert {dm[7][x]["classification"] for x in ("s1", "m1", "f1")} == {"unusable"}
+
+    spec = [
+        ("s1", 1, "S", 0), ("m1", 1, "M", 10), ("f1", 1, "F", 20),
+        ("badS", 1, "S", 500), ("badM", 1, "M", 5),
+    ]
+    dm, _ = dmap(spec, runners=(1,))
+    assert dm[1]["badS"]["classification"] == "unusable"
+    assert dm[1]["badM"]["classification"] == "unusable"
+    print("test_diagnose_unusable_and_zero_laps OK")
+
+
+def test_diagnose_order_and_multiple_runners():
+    # 未采纳记录严格按录入顺序返回；不同选手互不串台。
+    spec = [
+        ("u1", 101, "S", 700), ("u2", 101, "F", 800),
+        ("s1", 101, "S", 0), ("m1", 101, "M", 10), ("f1", 101, "F", 20),
+        ("u3", 101, "M", 5),
+        ("s9", 102, "S", 0), ("m9", 102, "M", 5),  # 102：两段太短，零趟
+    ]
+    dm, out = dmap(spec, runners=(101, 102))
+    ids101 = [d["id"] for d in out["runners"][0]["diagnoses"]]
+    assert ids101 == ["u1", "u2", "u3"], ids101
+    ids102 = [d["id"] for d in out["runners"][1]["diagnoses"]]
+    assert ids102 == ["s9", "m9"], ids102
+    assert all(dm[102][x]["classification"] == "unusable" for x in ("s9", "m9"))
+    print("test_diagnose_order_and_multiple_runners OK")
+
+
+def test_diagnose_validation_identical():
+    # 诊断与裁决共用同一套输入校验与中文报错。
+    bad = {
+        "standards": {"smMin": 10, "smMax": 9, "mfMin": 10, "mfMax": 60},
+        "runners": [{"number": 1}],
+        "records": [],
+    }
+    try:
+        diagnose(bad)
+        raise AssertionError("非法输入诊断也应报错")
+    except AdjudicationError:
+        pass
+    print("test_diagnose_validation_identical OK")
+
+
+def test_diagnose_fuzz_against_bruteforce():
+    """诊断分类与独立暴力 DFS（强制包含某条记录）对拍 500 组随机数据。"""
+    import functools
+
+    def brute(spec):
+        recs = [Record(id=i, runner=1, gate=g, time=t) for i, g, t in spec]
+        trips = _build_trips(recs, RANGES)
+        n = len(trips)
+
+        def better(a, b):
+            if b is None:
+                return True
+            if a[0] != b[0]:
+                return a[0] > b[0]
+            if a[1] != b[1]:
+                return a[1] < b[1]
+            return a[2] < b[2]
+
+        @functools.lru_cache(maxsize=None)
+        def solve(i, bound, rid, forced):
+            # 从 trips[i:] 选链（首趟起点 > bound）；rid 给定时强制链包含它。
+            if i >= n:
+                return (0, 0, ()) if (rid is None or forced) else None
+            best = solve(i + 1, bound, rid, forced)
+            t = trips[i]
+            if t.s.time > bound:
+                tail = solve(
+                    i + 1,
+                    t.f.time,
+                    rid,
+                    forced or (rid is not None and rid in t.ids),
+                )
+                if tail is not None:
+                    take = (tail[0] + 1, tail[1] + t.total, t.ids + tail[2])
+                    if better(take, best):
+                        best = take
+            return best
+
+        return recs, solve(0, -1, None, False), {
+            r.id: solve(0, -1, r.id, False) for r in recs
+        }
+
+    for seed in range(500):
+        rng = random.Random(seed)
+        n = rng.randint(3, 13)
+        tmax = rng.choice((60, 90, 200))
+        spec = [(f"r{i:02d}", rng.choice("SMF"), rng.randint(0, tmax)) for i in range(n)]
+        payload = {
+            "standards": {
+                "smMin": RANGES["SM"][0], "smMax": RANGES["SM"][1],
+                "mfMin": RANGES["MF"][0], "mfMax": RANGES["MF"][1],
+            },
+            "runners": [{"number": 1}],
+            "records": [
+                {"id": i, "runner": 1, "gate": g, "time": t} for i, g, t in spec
+            ],
+        }
+        adj = adjudicate(payload)["runners"][0]
+        diag = diagnose(payload)["runners"][0]
+        recs, adj_best, per = brute(spec)
+        K, T = adj["lapCount"], adj["totalTime"]
+        assert (adj_best[0], adj_best[1]) == (K, T), seed
+        used = {
+            x
+            for l in adj["laps"]
+            for x in (l["start"]["id"], l["middle"]["id"], l["finish"]["id"])
+        }
+        dmap = {d["id"]: d for d in diag["diagnoses"]}
+        # 只诊断未采纳，且严格按录入顺序。
+        assert set(dmap) == {r.id for r in recs if r.id not in used}, seed
+        assert [d["id"] for d in diag["diagnoses"]] == [
+            r.id for r in recs if r.id not in used
+        ], seed
+        for r in recs:
+            if r.id in used:
+                continue
+            d, bk = dmap[r.id], per[r.id]
+            if bk is None:
+                assert d["classification"] == "unusable", (seed, r.id, d)
+            elif bk[0] == K and bk[1] == T:
+                assert d["classification"] == "equal", (seed, r.id, d, bk)
+                a = d["alternative"]
+                assert (a["lapCount"], a["totalTime"], tuple(a["recordIds"])) == bk, (
+                    seed, r.id, a, bk
+                )
+                # 整套方案完整、不共用记录。
+                ids = a["recordIds"]
+                assert len(ids) == 3 * a["lapCount"], (seed, ids)
+                assert len(set(ids)) == len(ids), (seed, ids)
+            else:
+                assert d["classification"] == "inferior", (seed, r.id, d, bk)
+    print("test_diagnose_fuzz_against_bruteforce OK")
+
+
 if __name__ == "__main__":
     test_sample()
     test_zero_laps()
@@ -325,6 +580,14 @@ if __name__ == "__main__":
     test_count_beats_time()
     test_validation()
     test_big_runner_numbers()
+    test_diagnose_equal_second_lap()
+    test_diagnose_equal_first_lap_whole_plan()
+    test_diagnose_inferior_loses_count()
+    test_diagnose_inferior_same_count_longer_time()
+    test_diagnose_unusable_and_zero_laps()
+    test_diagnose_order_and_multiple_runners()
+    test_diagnose_validation_identical()
+    test_diagnose_fuzz_against_bruteforce()
     for seed in range(400):
         random_fuzz(seed, 6 + seed % 10)
     print("fuzz x400 OK")

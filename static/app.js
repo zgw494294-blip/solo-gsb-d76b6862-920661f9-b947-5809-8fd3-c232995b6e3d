@@ -74,6 +74,7 @@ const form = document.getElementById("judge-form");
 const errorBox = document.getElementById("error-box");
 const pendingHint = document.getElementById("pending-hint");
 const resultsBox = document.getElementById("results");
+const diagnosisBox = document.getElementById("diagnosis-box");
 
 /* ---------- 行管理 ---------- */
 
@@ -177,6 +178,23 @@ function clearOutcome() {
   errorBox.hidden = true;
   renderedLapKeys = []; // 结果区已清空，旧的趟键索引全部失效
   latestResult = null; // 名次表随之隐藏，等待最新合法结果
+  clearDiagnosis(); // 诊断附属于当前裁决结果：输入一改即清除，非法/重算期间不可检查
+}
+
+/* ---------- 未采纳记录替代性诊断（HTTP 只读分析，不改变采纳/复核/罚秒/名次） ---------- */
+
+// 诊断状态机（status）：
+//   idle     存在最新合法裁决，可点击“检查替代性”
+//   loading  诊断请求在途：禁用按钮，不再发起新诊断
+//   done     诊断成功并展示（可能含各档分类与同优替代方案）
+//   error    诊断请求失败（服务报错或无法连接），可重试
+// 诊断不写入裁决结果区：只渲染独立的 #diagnosis-box；输入一改（clearOutcome）即隐藏并
+// 重置；inputVersion 守卫保证迟到的成功或失败都不会覆盖更新状态。
+let diagnosisState = { status: "idle" };
+// 仅供无浏览器生命周期测试直接读取/驱动诊断状态。
+if (typeof globalThis !== "undefined") {
+  globalThis.__getDiagnosisStateForTest = () => diagnosisState;
+  globalThis.__runDiagnosisForTest = () => runDiagnosis();
 }
 
 function onInputChanged() {
@@ -435,6 +453,8 @@ form.addEventListener("submit", (e) => {
     debounceTimer = null;
   }
   pendingHint.hidden = false;
+  // 重算期间诊断不可用：按新一次重算重置（旧诊断响应由版本守卫丢弃）。
+  resetDiagnosis();
   runAdjudication();
 });
 
@@ -910,7 +930,253 @@ function renderResults(result) {
     .join("");
   // 名次表排在最前，使用渲染这一刻已保存的罚秒。
   resultsBox.innerHTML = rankingCardHtml(result) + runnerCards;
+  // 新的合法裁决到达：诊断恢复为可检查的初始态（旧输入的诊断已在 clearOutcome 清除）。
+  resetDiagnosis();
 }
+
+/* ---------- 替代性诊断 ---------- */
+
+const DIAG_LABELS = {
+  equal: "同优可替代",
+  inferior: "仅次优可用",
+  unusable: "无法成趟",
+};
+const DIAG_HINTS = {
+  equal: "存在包含该记录、且计次数与原总用时都与现方案相同的合法完整方案（仅 ID 决胜不同；与罚秒无关）",
+  inferior: "该记录能组成合格趟，但任何完整方案的计次数或原总用时都达不到现方案",
+  unusable: "该选手的任何合格趟都不包含这条记录",
+};
+
+function clearDiagnosis() {
+  diagnosisState = { status: "idle" };
+  diagnosisBox.hidden = true;
+  diagnosisBox.innerHTML = "";
+}
+
+// 合法裁决结果到达后进入可检查状态（卡片显示、按钮可点）。
+function resetDiagnosis() {
+  diagnosisState = { status: "idle" };
+  paintDiagnosis();
+}
+
+// 诊断响应规范化：编号/秒数/总用时一律规范十进制字符串，计次数为 Number；
+// 分类代码只接受三档白名单，其余视为异常响应，避免展示脏数据。
+function normalizeDiagnosis(result) {
+  for (const r of result.runners) {
+    r.runner = typeof r.runner === "string" ? r.runner : String(r.runner);
+    r.lapCount = typeof r.lapCount === "string" ? Number(r.lapCount) : r.lapCount;
+    r.totalTime = intToText(r.totalTime);
+    for (const d of r.diagnoses) {
+      d.time = intToText(d.time);
+      if (!(d.classification in DIAG_LABELS)) {
+        throw new Error("诊断服务返回了无法识别的分类");
+      }
+      if (d.classification === "equal") {
+        const a = d.alternative;
+        if (!a || !Array.isArray(a.recordIds)) throw new Error("同优诊断缺少替代方案");
+        a.lapCount = typeof a.lapCount === "string" ? Number(a.lapCount) : a.lapCount;
+        a.totalTime = intToText(a.totalTime);
+      }
+    }
+  }
+  return result;
+}
+
+async function runDiagnosis() {
+  // 重算在途、无合法结果、已有诊断在途时都不可检查。
+  if (diagnosisState.status === "loading" || !latestResult) return;
+  const version = inputVersion;
+  diagnosisState = { status: "loading" };
+  paintDiagnosis();
+
+  let resp;
+  let data;
+  try {
+    resp = await fetch("/api/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // 以当前完整裁决输入发起诊断（与裁决请求同一份载荷）。
+      body: JSON.stringify(collectPayload()),
+    });
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    // 迟到的失败不得覆盖较新输入的状态。
+    if (version !== inputVersion) return;
+    diagnosisState = { status: "error", message: `无法连接诊断服务：${err.message}` };
+    paintDiagnosis();
+    return;
+  }
+  if (version !== inputVersion) return; // 迟到的成功同样丢弃
+  if (!resp.ok || !data.ok) {
+    // 当前输入本应与已展示的合法裁决一致；服务报错只在诊断卡内呈现，不动采纳结果。
+    diagnosisState = {
+      status: "error",
+      message: (data && data.error) || `诊断失败（HTTP ${resp.status}）`,
+    };
+    paintDiagnosis();
+    return;
+  }
+  try {
+    normalizeDiagnosis(data.result);
+  } catch (err) {
+    diagnosisState = { status: "error", message: err.message };
+    paintDiagnosis();
+    return;
+  }
+  diagnosisState = { status: "done", result: data.result };
+  paintDiagnosis();
+}
+
+function diagnosisHeadHtml() {
+  return `
+    <div class="result-head">
+      <h3>未采纳记录替代性诊断</h3>
+      <span class="review-scope">只读分析：不替换采纳结果，不改变计次、复核、罚秒或名次</span>
+    </div>`;
+}
+
+function diagnosisIdleHtml() {
+  return `
+    ${diagnosisHeadHtml()}
+    <p class="diag-intro">
+      以当前完整裁决输入经 HTTP 诊断每名选手的<strong>未采纳记录</strong>：
+      同优判断只比“计次数 + 原总用时”，不考虑 ID 决胜和罚秒，并给出包含目标记录的整套替代方案。
+    </p>
+    <div class="diag-actions">
+      <button type="button" class="btn primary diagnose-run">🔎 检查替代性</button>
+      <span class="diag-action-hint">仅在当前输入合法且未在重算时可检查；输入一改即清除本诊断。</span>
+    </div>`;
+}
+
+function diagnosisLoadingHtml() {
+  return `
+    ${diagnosisHeadHtml()}
+    <div class="diag-loading">
+      <span class="diag-spinner" aria-hidden="true"></span>
+      正在经 HTTP 诊断未采纳记录的替代性…
+    </div>`;
+}
+
+function diagnosisErrorHtml(message) {
+  return `
+    ${diagnosisHeadHtml()}
+    <div class="diag-error">⚠ ${escapeHtml(message)}</div>
+    <div class="diag-actions">
+      <button type="button" class="btn secondary diagnose-run">重试诊断</button>
+    </div>`;
+}
+
+function alternativeHtml(alt, targetId) {
+  // 整套方案的 ID 序列按计次时间顺序排列（每 3 条一趟），目标记录高亮，不只展示单趟。
+  const groups = [];
+  for (let i = 0; i < alt.recordIds.length; i += 3) {
+    const ids = alt.recordIds.slice(i, i + 3);
+    groups.push(
+      `<span class="diag-lap">第 ${i / 3 + 1} 趟：` +
+        ids
+          .map((id) =>
+            id === targetId
+              ? `<strong class="diag-target-id">${escapeHtml(id)}</strong>`
+              : escapeHtml(id)
+          )
+          .join(" → ") +
+        "</span>"
+    );
+  }
+  return `
+    <div class="diag-alt">
+      <div class="diag-alt-meta">
+        整套替代方案：<strong>${alt.lapCount}</strong> 次 · 原总用时
+        <strong>${alt.totalTime}</strong> 秒（与现方案计次数、原总用时相同）
+      </div>
+      <div class="diag-alt-laps">${groups.join("")}</div>
+    </div>`;
+}
+
+function diagnosisItemHtml(item) {
+  return `
+    <div class="diag-item diag-${item.classification}">
+      <div class="diag-item-line">
+        <span class="chip-mini ${item.gate}">${GATE_LABELS[item.gate]} · ${escapeHtml(
+    item.id
+  )} · ${item.time} 秒</span>
+        <span class="diag-badge diag-badge-${item.classification}">${
+    DIAG_LABELS[item.classification]
+  }</span>
+      </div>
+      <div class="diag-hint">${DIAG_HINTS[item.classification]}</div>
+      ${item.classification === "equal" ? alternativeHtml(item.alternative, item.id) : ""}
+    </div>`;
+}
+
+function diagnosisRunnerHtml(r) {
+  const head =
+    r.lapCount === 0
+      ? `选手 ${r.runner} · 现方案 0 次（无完整计次）`
+      : `选手 ${r.runner} · 现方案 ${r.lapCount} 次 · 原总用时 ${r.totalTime} 秒`;
+  const counts = { equal: 0, inferior: 0, unusable: 0 };
+  for (const d of r.diagnoses) counts[d.classification] += 1;
+  const summary =
+    r.diagnoses.length === 0
+      ? ""
+      : `<div class="diag-summary">同优可替代 ${counts.equal} · 仅次优可用 ${counts.inferior} · 无法成趟 ${counts.unusable}</div>`;
+  const body =
+    r.diagnoses.length === 0
+      ? `<div class="empty-line">（无未采纳记录）</div>`
+      : r.diagnoses.map(diagnosisItemHtml).join("");
+  return `
+    <div class="diag-runner">
+      <div class="diag-runner-head">${head}</div>
+      ${summary}
+      ${body}
+    </div>`;
+}
+
+function diagnosisDoneHtml(result) {
+  return `
+    ${diagnosisHeadHtml()}
+    <p class="diag-intro">
+      下列诊断针对当前未采纳记录；诊断为只读结果，采纳方案、人工复核、罚秒与名次均保持不变。
+    </p>
+    ${result.runners.map(diagnosisRunnerHtml).join("")}
+    <div class="diag-actions">
+      <button type="button" class="btn ghost diagnose-rerun">重新诊断</button>
+      <span class="diag-action-hint">修改任意输入后本诊断立即清除，需在新结果上重新检查。</span>
+    </div>`;
+}
+
+function paintDiagnosis() {
+  // 无合法结果时（重算中、非法、清空）诊断卡整体隐藏，不可检查。
+  if (!latestResult) {
+    diagnosisBox.hidden = true;
+    return;
+  }
+  switch (diagnosisState.status) {
+    case "idle":
+      diagnosisBox.innerHTML = diagnosisIdleHtml();
+      break;
+    case "loading":
+      diagnosisBox.innerHTML = diagnosisLoadingHtml();
+      break;
+    case "error":
+      diagnosisBox.innerHTML = diagnosisErrorHtml(diagnosisState.message);
+      break;
+    case "done":
+      diagnosisBox.innerHTML = diagnosisDoneHtml(diagnosisState.result);
+      break;
+  }
+  diagnosisBox.hidden = false;
+}
+
+// 诊断按钮事件委托：loading 态按钮不存在/禁用，非法或重算期间卡片隐藏，皆不可点。
+diagnosisBox.addEventListener("click", (e) => {
+  if (!e.target.classList.contains("diagnose-run") &&
+      !e.target.classList.contains("diagnose-rerun")) {
+    return;
+  }
+  if (diagnosisState.status === "loading" || !latestResult) return;
+  runDiagnosis();
+});
 
 /* ---------- 工具 ---------- */
 

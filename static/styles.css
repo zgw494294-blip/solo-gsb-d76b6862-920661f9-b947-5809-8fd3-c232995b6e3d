@@ -283,6 +283,95 @@ input:focus, select:focus {
 
 .subsection { margin-top: 0.7rem; }
 .subsection h4 { margin: 0 0 0.4rem; font-size: 0.9rem; color: var(--muted); }
+
+/* ---------- 未采纳记录替代性诊断 ---------- */
+#diagnosis-box .diag-intro {
+  margin: 0 0 0.7rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.diag-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+  margin-top: 0.7rem;
+}
+.diag-action-hint { color: var(--muted); font-size: 0.8rem; }
+.diag-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--brand-dark);
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  padding: 0.55rem 0.8rem;
+  font-size: 0.9rem;
+}
+.diag-spinner {
+  width: 0.95rem;
+  height: 0.95rem;
+  border: 2px solid #bfdbfe;
+  border-top-color: var(--brand);
+  border-radius: 50%;
+  animation: diag-spin 0.8s linear infinite;
+}
+@keyframes diag-spin { to { transform: rotate(360deg); } }
+.diag-error {
+  background: var(--err-bg);
+  border: 1px solid #fecaca;
+  color: var(--err);
+  border-radius: 8px;
+  padding: 0.55rem 0.8rem;
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+.diag-runner {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.6rem;
+  background: #fbfcfe;
+}
+.diag-runner-head { font-weight: 600; font-size: 0.92rem; }
+.diag-summary { margin: 0.3rem 0 0.55rem; color: var(--muted); font-size: 0.82rem; }
+.diag-item {
+  border-left: 3px solid var(--line);
+  padding: 0.4rem 0.6rem;
+  margin: 0.45rem 0;
+  background: #fff;
+  border-radius: 0 7px 7px 0;
+}
+.diag-item.diag-equal { border-left-color: var(--ok); background: var(--ok-bg); }
+.diag-item.diag-inferior { border-left-color: var(--warn); background: var(--warn-bg); }
+.diag-item.diag-unusable { border-left-color: #9ca3af; background: #f9fafb; }
+.diag-item-line { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.diag-badge {
+  font-size: 0.8rem;
+  font-weight: 700;
+  padding: 0.08rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.diag-badge-equal { background: #d1fae5; color: var(--ok); border-color: #a7f3d0; }
+.diag-badge-inferior { background: #fef3c7; color: var(--warn); border-color: #fde68a; }
+.diag-badge-unusable { background: #e5e7eb; color: var(--muted); border-color: #d1d5db; }
+.diag-hint { margin-top: 0.25rem; color: var(--muted); font-size: 0.8rem; }
+.diag-alt {
+  margin-top: 0.4rem;
+  border-top: 1px dashed var(--line);
+  padding-top: 0.4rem;
+}
+.diag-alt-meta { font-size: 0.83rem; color: var(--ink); }
+.diag-alt-laps { display: flex; flex-direction: column; gap: 0.2rem; margin-top: 0.3rem; }
+.diag-lap { font-size: 0.83rem; }
+.diag-target-id {
+  color: var(--ok);
+  background: #d1fae5;
+  border-radius: 4px;
+  padding: 0 0.25rem;
+}
 .chip-mini {
   display: inline-block;
   border-radius: 6px;

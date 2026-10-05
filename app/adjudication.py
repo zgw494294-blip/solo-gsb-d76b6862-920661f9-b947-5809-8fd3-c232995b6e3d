@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -220,6 +220,8 @@ def _build_trips(
 # 趟数越大越好；总用时、ID 序列越小越好。
 Key = tuple[int, int, tuple[str, ...]]
 
+EMPTY_KEY: Key = (0, 0, ())
+
 
 def _key_better(cand: Key, best: Key | None) -> bool:
     """cand 是否优于（或等于）当前最优 best。"""
@@ -232,12 +234,12 @@ def _key_better(cand: Key, best: Key | None) -> bool:
     return cand[2] < best[2]
 
 
-def _adjudicate_one(
-    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
-) -> dict:
-    mine = [r for r in records if r.runner == runner]
-    trips = _build_trips(mine, ranges)
+def _best_plan(trips: list[Trip]) -> tuple[Key, set[str], list[Trip]]:
+    """在按终点时间排序的合法趟 DAG 上求最优完整方案。
 
+    返回 (最优键, 采纳记录 ID 集合, 按时间顺序排列的采纳趟)。
+    与裁决输出完全一致：趟数最多 → 总用时最短 → ID 串接序列字典序最小。
+    """
     finish_times = [t.f.time for t in trips]
 
     # prev[i]：以 trips[i] 结尾的最优链中，上一趟的下标（-1 为首趟）。
@@ -289,6 +291,175 @@ def _adjudicate_one(
         for trip in chosen:
             used.update(trip.ids)
 
+    return (prefix_best[-1] if trips else EMPTY_KEY), used, chosen
+
+
+def _suffix_best_by_start(
+    trips_f: list[Trip], start_order: list[int]
+) -> list[Key]:
+    """后缀最优键：suffix[k] 为只使用 start_order[k:] 中趟时的最优完整链键。
+
+    start_order 给出按起点时间升序（同秒按确定性次序）排列的 trips_f 下标。
+    suffix[k] 对应链的首趟起点必然 >= start_times[k]：对目标趟 T，取
+    q = bisect_left(start_times, T.f.time + 1) 后拼接 suffix[q]，即可保证
+    后缀首趟起点严格晚于 T 的终点。链内趟与趟按时间严格分离（趟内 s<m<f、
+    相邻趟 s>前驱 f），因此同链趟之间不可能共用记录，前缀/后缀可独立求最优后
+    与目标趟直接拼接。
+    """
+    n = len(trips_f)
+    start_times = [trips_f[i].s.time for i in start_order]
+    suffix: list[Key] = [EMPTY_KEY] * n
+
+    for k in range(n - 1, -1, -1):
+        i = start_order[k]
+        trip = trips_f[i]
+        take: Key = (1, trip.total, trip.ids)
+        # 后继首趟起点必须严格晚于本趟终点：按起点时间二分，而非按下标 +1
+        # （同一秒存在多条趟时，下标 +1 取到的仍是同秒趟，会错误共用记录）。
+        q = bisect_left(start_times, trip.f.time + 1, k + 1, n)
+        if q < n:
+            sk = suffix[q]
+            if sk[0] > 0:
+                cand: Key = (sk[0] + 1, trip.total + sk[1], trip.ids + sk[2])
+                if _key_better(cand, take):
+                    take = cand
+
+        # 后缀最优（允许跳过本趟）：在 take 与 suffix[k+1] 间取优。
+        if k == n - 1 or _key_better(take, suffix[k + 1]):
+            suffix[k] = take
+        else:
+            suffix[k] = suffix[k + 1]
+    return suffix
+
+
+def _prefix_best_keys(trips_f: list[Trip]) -> tuple[list[Key], list[int]]:
+    """终点排序数组的逐前缀最优链键与对应终点时间：prefix_best[i] 为只用 trips[0..i] 时的最优。"""
+    finish_times = [t.f.time for t in trips_f]
+    prefix_best: list[Key] = []
+    for i, trip in enumerate(trips_f):
+        best: Key = (1, trip.total, trip.ids)
+        p = bisect_right(finish_times, trip.s.time - 1, 0, i) - 1
+        if p >= 0:
+            pk = prefix_best[p]
+            cand = (pk[0] + 1, pk[1] + trip.total, pk[2] + trip.ids)
+            if _key_better(cand, best):
+                best = cand
+        if i == 0:
+            prefix_best.append(best)
+        elif _key_better(best, prefix_best[-1]):
+            prefix_best.append(best)
+        else:
+            prefix_best.append(prefix_best[-1])
+    return prefix_best, finish_times
+
+
+def _best_through_trip(
+    trip_i: int,
+    trips_f: list[Trip],
+    start_times: list[int],
+    finish_times: list[int],
+    prefix_best: list[Key],
+    suffix: list[Key],
+) -> Key:
+    """包含 trips_f[trip_i] 这一趟的最优完整链键：最优前缀 + 该趟 + 最优后缀。"""
+    trip = trips_f[trip_i]
+
+    # 前缀：终点严格早于本趟起点（终点序前缀最优即保证整链与目标趟时间分离）。
+    p = bisect_right(finish_times, trip.s.time - 1, 0, trip_i) - 1
+    pre: Key = prefix_best[p] if p >= 0 else EMPTY_KEY
+
+    # 后缀：首趟起点严格晚于本趟终点（按起点时间二分）。
+    q = bisect_left(start_times, trip.f.time + 1)
+    post: Key = suffix[q] if q < len(trips_f) else EMPTY_KEY
+
+    return (pre[0] + 1 + post[0], pre[1] + trip.total + post[1], pre[2] + trip.ids + post[2])
+
+
+# 替代性诊断三档分类（值为稳定的英文代码，中文标签由页面呈现）：
+# equal    同优可替代：存在包含目标记录、计次数与原总用时都与现方案相同的合法完整方案
+# inferior 仅次优可用：至少属于一条合格趟，但任何完整方案都达不到现方案的计次数/总用时
+# unusable 无法成趟：该选手的任何一条合格趟都不包含该记录
+DIAG_EQUAL = "equal"
+DIAG_INFERIOR = "inferior"
+DIAG_UNUSABLE = "unusable"
+
+
+def _diagnose_one(
+    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+) -> dict:
+    mine = [r for r in records if r.runner == runner]
+    trips = _build_trips(mine, ranges)
+
+    best_key, used, _chosen = _best_plan(trips)
+    target_count, target_total = best_key[0], best_key[1]
+
+    # 起点升序的趟次序（同秒时沿用与终点排序一致的确定性键，保证结果稳定）。
+    start_order = sorted(
+        range(len(trips)),
+        key=lambda i: (
+            trips[i].s.time,
+            trips[i].f.time,
+            trips[i].m.time,
+            trips[i].total,
+            trips[i].s.id,
+            trips[i].m.id,
+            trips[i].f.id,
+        ),
+    )
+    suffix = _suffix_best_by_start(trips, start_order)
+    start_times = [trips[i].s.time for i in start_order]
+    prefix_best, finish_times = _prefix_best_keys(trips)
+
+    # 每条记录 -> 包含它的最优完整链键（遍历所有包含该记录的合格趟取最优）。
+    best_with: dict[str, Key] = {}
+    for i, trip in enumerate(trips):
+        key = _best_through_trip(
+            i, trips, start_times, finish_times, prefix_best, suffix
+        )
+        for rid in trip.ids:
+            cur = best_with.get(rid)
+            if cur is None or _key_better(key, cur):
+                best_with[rid] = key
+
+    def classify(rec_id: str) -> tuple[str, Key | None]:
+        key = best_with.get(rec_id)
+        if key is None:
+            return DIAG_UNUSABLE, None
+        if key[0] == target_count and key[1] == target_total:
+            return DIAG_EQUAL, key
+        return DIAG_INFERIOR, key
+
+    items: list[dict] = []
+    for rec in mine:
+        if rec.id in used:
+            continue  # 只诊断未采纳记录
+        cls, key = classify(rec.id)
+        item = {"id": rec.id, "gate": rec.gate, "time": rec.time, "classification": cls}
+        if cls == DIAG_EQUAL:
+            assert key is not None
+            item["alternative"] = {
+                "lapCount": key[0],
+                "totalTime": key[1],
+                "recordIds": list(key[2]),
+            }
+        items.append(item)
+
+    return {
+        "runner": runner,
+        "lapCount": target_count,
+        "totalTime": target_total,
+        "diagnoses": items,
+    }
+
+
+def _adjudicate_one(
+    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+) -> dict:
+    mine = [r for r in records if r.runner == runner]
+    trips = _build_trips(mine, ranges)
+
+    _best_key, used, chosen = _best_plan(trips)
+
     laps_out = [
         {
             "start": {"id": t.s.id, "time": t.s.time},
@@ -319,4 +490,20 @@ def adjudicate(payload: Any) -> dict:
     runner_ids, ranges, records = parse_payload(payload)
     return {
         "runners": [_adjudicate_one(rid, records, ranges) for rid in runner_ids]
+    }
+
+
+def diagnose(payload: Any) -> dict:
+    """替代性诊断入口：输入与裁决完全相同（同一套校验），只诊断未采纳记录。
+
+    对每名选手返回按录入顺序排列的未采纳记录分类：
+    - equal：存在包含该记录、且计次数与原总用时都与现方案相同的合法完整方案，
+      同时给出该套方案按计次时间顺序串接的完整记录 ID 序列（同优多方案取字典序最小）；
+    - inferior：该记录至少属于一条合格趟，但任何完整方案都达不到现方案；
+    - unusable：该选手的任何合格趟都不包含它。
+    同优判定只比 (计次数, 原总用时)，不考虑 ID 决胜与罚秒。
+    """
+    runner_ids, ranges, records = parse_payload(payload)
+    return {
+        "runners": [_diagnose_one(rid, records, ranges) for rid in runner_ids]
     }
